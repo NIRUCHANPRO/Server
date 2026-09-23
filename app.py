@@ -1,6 +1,9 @@
 import os
+import threading
+import time
 from datetime import datetime, timezone
 
+import requests
 from flask import Flask, jsonify, render_template_string, request
 from mcstatus import JavaServer
 
@@ -9,68 +12,103 @@ app = Flask(__name__)
 HOST = os.getenv("MINECRAFT_HOST", "").strip()
 PORT = int(os.getenv("MINECRAFT_PORT", "25565"))
 SECRET = os.getenv("DASHBOARD_SECRET", "").strip()
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
+CHECK_INTERVAL = 30
+
+state = {
+    "online": False,
+    "configured": bool(HOST),
+    "players": 0,
+    "max_players": 0,
+    "latency": None,
+    "version": None,
+    "address": f"{HOST}:{PORT}" if HOST else None,
+    "last_check": None,
+    "last_change": None,
+    "online_since": None,
+    "checks": 0,
+    "uptime_checks": 0,
+    "history": [],
+}
+
+state_lock = threading.Lock()
 
 
 PAGE = """
 <!doctype html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Niruchan Minecraft Monitor</title>
 
-    <title>Niruchan Minecraft Monitor</title>
+<style>
+body {
+    font-family: system-ui, sans-serif;
+    max-width: 1000px;
+    margin: 30px auto;
+    padding: 0 18px;
+    background: #101318;
+    color: #eee;
+}
 
-    <style>
-        body {
-            font-family: system-ui, sans-serif;
-            max-width: 900px;
-            margin: 40px auto;
-            padding: 0 18px;
-            background: #101318;
-            color: #eee;
-        }
+.card, .metric {
+    background: #191e26;
+    border: 1px solid #2b323d;
+    border-radius: 14px;
+    padding: 20px;
+    margin: 12px 0;
+}
 
-        .card, .metric {
-            background: #191e26;
-            border: 1px solid #2b323d;
-            border-radius: 14px;
-            padding: 20px;
-            margin: 12px 0;
-        }
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+}
 
-        .grid {
-            display: grid;
-            grid-template-columns:
-                repeat(auto-fit, minmax(170px, 1fr));
-            gap: 12px;
-        }
+.metric {
+    margin: 0;
+}
 
-        .metric {
-            margin: 0;
-        }
+.muted {
+    color: #aab2bf;
+}
 
-        .muted {
-            color: #aab2bf;
-        }
+.status {
+    font-size: 32px;
+    font-weight: 800;
+}
 
-        .status {
-            font-size: 30px;
-            font-weight: 800;
-        }
+.online {
+    color: #72d572;
+}
 
-        .online {
-            color: #72d572;
-        }
+.offline {
+    color: #ff7777;
+}
 
-        .offline {
-            color: #ff7777;
-        }
+.value {
+    font-size: 22px;
+    font-weight: 700;
+    margin-top: 5px;
+}
 
-        .value {
-            font-size: 23px;
-            font-weight: 700;
-        }
-    </style>
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th, td {
+    padding: 10px;
+    border-bottom: 1px solid #2b323d;
+    text-align: left;
+}
+
+.small {
+    font-size: 13px;
+}
+</style>
 </head>
 
 <body>
@@ -78,94 +116,227 @@ PAGE = """
 <div class="card">
     <h1>Niruchan Minecraft Monitor</h1>
 
-    <div id="s" class="status">
+    <div id="status" class="status">
         Checking...
     </div>
 
-    <p id="t" class="muted"></p>
+    <p id="address" class="muted"></p>
+    <p id="lastCheck" class="muted"></p>
 </div>
 
 
 <div class="grid">
 
     <div class="metric">
-        <span class="muted">Players</span>
-        <div id="p" class="value">—</div>
+        <div class="muted">Players</div>
+        <div id="players" class="value">—</div>
     </div>
 
     <div class="metric">
-        <span class="muted">Latency</span>
-        <div id="l" class="value">—</div>
+        <div class="muted">Latency</div>
+        <div id="latency" class="value">—</div>
     </div>
 
     <div class="metric">
-        <span class="muted">Version</span>
-        <div id="v" class="value">—</div>
+        <div class="muted">Version</div>
+        <div id="version" class="value">—</div>
     </div>
 
     <div class="metric">
-        <span class="muted">Address</span>
-        <div id="a" class="value">—</div>
+        <div class="muted">Uptime</div>
+        <div id="uptime" class="value">—</div>
     </div>
+
+    <div class="metric">
+        <div class="muted">Total Checks</div>
+        <div id="checks" class="value">—</div>
+    </div>
+
+    <div class="metric">
+        <div class="muted">Online Checks</div>
+        <div id="onlineChecks" class="value">—</div>
+    </div>
+
+</div>
+
+
+<div class="card">
+
+    <h2>Recent History</h2>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Status</th>
+                <th>Players</th>
+                <th>Latency</th>
+            </tr>
+        </thead>
+
+        <tbody id="history"></tbody>
+    </table>
 
 </div>
 
 
 <script>
 
-async function updateStatus() {
+function formatUptime(seconds) {
+
+    if (!seconds) {
+        return "—";
+    }
+
+    seconds = Math.floor(seconds);
+
+    const days = Math.floor(seconds / 86400);
+    seconds %= 86400;
+
+    const hours = Math.floor(seconds / 3600);
+    seconds %= 3600;
+
+    const minutes = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+
+    let result = "";
+
+    if (days) {
+        result += days + "d ";
+    }
+
+    if (hours) {
+        result += hours + "h ";
+    }
+
+    if (minutes) {
+        result += minutes + "m ";
+    }
+
+    result += secs + "s";
+
+    return result;
+}
+
+
+async function updateDashboard() {
 
     try {
 
         const response = await fetch(
-            "/api/status?_" + Date.now()
+            "/api/status?_=" + Date.now()
         );
 
-        const d = await response.json();
+        const data = await response.json();
 
-        const status = document.getElementById("s");
-        const players = document.getElementById("p");
-        const latency = document.getElementById("l");
-        const version = document.getElementById("v");
-        const address = document.getElementById("a");
-        const time = document.getElementById("t");
-
+        const status =
+            document.getElementById("status");
 
         status.textContent =
-            d.online ? "ONLINE" : "OFFLINE";
+            data.online ? "ONLINE" : "OFFLINE";
 
         status.className =
             "status " +
-            (d.online ? "online" : "offline");
+            (data.online ? "online" : "offline");
 
 
-        players.textContent =
-            d.online
-                ? d.players.online + " / " + d.players.max
+        document.getElementById("address")
+            .textContent =
+            data.address || "Not configured";
+
+
+        document.getElementById("players")
+            .textContent =
+            data.online
+                ? data.players.online +
+                  " / " +
+                  data.players.max
                 : "—";
 
 
-        latency.textContent =
-            d.online
-                ? Math.round(d.latency) + " ms"
+        document.getElementById("latency")
+            .textContent =
+            data.online
+                ? Math.round(data.latency) + " ms"
                 : "—";
 
 
-        version.textContent =
-            d.version || "—";
+        document.getElementById("version")
+            .textContent =
+            data.version || "—";
 
 
-        address.textContent =
-            d.address || "Not configured";
+        document.getElementById("checks")
+            .textContent =
+            data.checks;
 
 
-        time.textContent =
-            "Last check: " +
-            new Date(d.checked_at).toLocaleString();
+        document.getElementById("onlineChecks")
+            .textContent =
+            data.uptime_checks;
+
+
+        document.getElementById("uptime")
+            .textContent =
+            formatUptime(data.uptime_seconds);
+
+
+        if (data.last_check) {
+
+            document.getElementById("lastCheck")
+                .textContent =
+                "Last check: " +
+                new Date(
+                    data.last_check
+                ).toLocaleString();
+
+        }
+
+
+        const history =
+            document.getElementById("history");
+
+        history.innerHTML = "";
+
+
+        for (const item of data.history) {
+
+            const row =
+                document.createElement("tr");
+
+            row.innerHTML =
+                "<td class='small'>" +
+                new Date(
+                    item.time
+                ).toLocaleString() +
+                "</td>" +
+
+                "<td>" +
+                (item.online
+                    ? "ONLINE"
+                    : "OFFLINE") +
+                "</td>" +
+
+                "<td>" +
+                (item.online
+                    ? item.players
+                    : "—") +
+                "</td>" +
+
+                "<td>" +
+                (item.online
+                    ? Math.round(item.latency) +
+                      " ms"
+                    : "—") +
+                "</td>";
+
+            history.appendChild(row);
+        }
 
     } catch (error) {
 
-        const status = document.getElementById("s");
+        const status =
+            document.getElementById("status");
 
         status.textContent = "ERROR";
         status.className = "status offline";
@@ -173,9 +344,12 @@ async function updateStatus() {
 }
 
 
-updateStatus();
+updateDashboard();
 
-setInterval(updateStatus, 30000);
+setInterval(
+    updateDashboard,
+    30000
+);
 
 </script>
 
@@ -184,28 +358,37 @@ setInterval(updateStatus, 30000);
 """
 
 
-def get_status():
+def send_discord(message):
 
-    now = datetime.now(timezone.utc).isoformat()
+    if not DISCORD_WEBHOOK:
+        return
+
+    try:
+
+        requests.post(
+            DISCORD_WEBHOOK,
+            json={
+                "content": message
+            },
+            timeout=8
+        )
+
+    except Exception:
+
+        pass
+
+
+def minecraft_check():
 
     if not HOST:
 
         return {
             "online": False,
-            "configured": False,
-            "address": None,
-            "players": {
-                "online": 0,
-                "max": 0
-            },
+            "players": 0,
+            "max_players": 0,
             "latency": None,
             "version": None,
-            "checked_at": now,
-            "error": "MINECRAFT_HOST is not configured"
         }
-
-
-    address = f"{HOST}:{PORT}"
 
     try:
 
@@ -215,43 +398,119 @@ def get_status():
             timeout=4
         )
 
-        status = server.status()
-
+        result = server.status()
 
         return {
             "online": True,
-            "configured": True,
-            "address": address,
-            "players": {
-                "online": status.players.online,
-                "max": status.players.max
-            },
-            "latency": status.latency,
+            "players": result.players.online,
+            "max_players": result.players.max,
+            "latency": result.latency,
             "version": getattr(
-                status.version,
+                result.version,
                 "name",
                 None
             ),
-            "checked_at": now,
-            "error": None
         }
 
-
-    except Exception as error:
+    except Exception:
 
         return {
             "online": False,
-            "configured": True,
-            "address": address,
-            "players": {
-                "online": 0,
-                "max": 0
-            },
+            "players": 0,
+            "max_players": 0,
             "latency": None,
             "version": None,
-            "checked_at": now,
-            "error": str(error)
         }
+
+
+def monitor_loop():
+
+    while True:
+
+        try:
+
+            result = minecraft_check()
+
+            now = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            should_alert = False
+            alert_message = ""
+
+            with state_lock:
+
+                previous = state["online"]
+
+                state["online"] = result["online"]
+                state["players"] = result["players"]
+                state["max_players"] = result["max_players"]
+                state["latency"] = result["latency"]
+                state["version"] = result["version"]
+                state["last_check"] = now
+                state["checks"] += 1
+
+                if result["online"]:
+                    state["uptime_checks"] += 1
+
+
+                if previous != result["online"]:
+
+                    state["last_change"] = now
+
+                    if result["online"]:
+
+                        state["online_since"] = now
+
+                        should_alert = True
+
+                        alert_message = (
+                            "🟢 **Mahal Series is ONLINE**\n"
+                            f"Players: "
+                            f"{result['players']}/"
+                            f"{result['max_players']}\n"
+                            f"Latency: "
+                            f"{round(result['latency'])} ms"
+                        )
+
+                    else:
+
+                        state["online_since"] = None
+
+                        should_alert = True
+
+                        alert_message = (
+                            "🔴 **Mahal Series is OFFLINE**"
+                        )
+
+
+                state["history"].insert(
+                    0,
+                    {
+                        "time": now,
+                        "online": result["online"],
+                        "players": result["players"],
+                        "latency": result["latency"],
+                    }
+                )
+
+                state["history"] = \
+                    state["history"][:50]
+
+
+            if should_alert:
+
+                send_discord(
+                    alert_message
+                )
+
+        except Exception:
+
+            pass
+
+        time.sleep(
+            CHECK_INTERVAL
+        )
 
 
 @app.get("/")
@@ -271,7 +530,36 @@ def health():
 @app.get("/api/status")
 def api_status():
 
-    return jsonify(get_status())
+    with state_lock:
+
+        data = dict(state)
+
+        data["history"] = list(
+            state["history"]
+        )
+
+        if (
+            state["online"]
+            and state["online_since"]
+        ):
+
+            started = datetime.fromisoformat(
+                state["online_since"]
+            )
+
+            now = datetime.now(
+                timezone.utc
+            )
+
+            data["uptime_seconds"] = (
+                now - started
+            ).total_seconds()
+
+        else:
+
+            data["uptime_seconds"] = 0
+
+        return jsonify(data)
 
 
 @app.get("/api/check")
@@ -290,8 +578,22 @@ def api_check():
                 "error": "unauthorized"
             }), 401
 
+    return jsonify(
+        minecraft_check()
+    )
 
-    return jsonify(get_status())
+
+def start_monitor():
+
+    thread = threading.Thread(
+        target=monitor_loop,
+        daemon=True
+    )
+
+    thread.start()
+
+
+start_monitor()
 
 
 if __name__ == "__main__":
