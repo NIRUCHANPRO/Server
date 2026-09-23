@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: niruchan-minecraft-monitor
+    runtime: python
+    plan: free
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: gunicorn --bind 0.0.0.0:$PORT app:app
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: MINECRAFT_HOST
+        sync: false
+
+      - key: MINECRAFT_PORT
+        value: "25565"
+
+      - key: DASHBOARD_SECRET
+        sync: false
