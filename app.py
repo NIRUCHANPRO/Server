@@ -1,606 +1,937 @@
 import os
-import threading
 import time
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timezone, timedelta
 
 import requests
-from flask import Flask, jsonify, render_template_string, request
+import psycopg
+from flask import Flask, jsonify, render_template_string
 from mcstatus import JavaServer
 
 app = Flask(__name__)
 
-HOST = os.getenv("MINECRAFT_HOST", "").strip()
-PORT = int(os.getenv("MINECRAFT_PORT", "25565"))
-SECRET = os.getenv("DASHBOARD_SECRET", "").strip()
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+MINECRAFT_HOST = os.getenv("MINECRAFT_HOST", "MahalSeries.aternos.me")
+MINECRAFT_PORT = int(os.getenv("MINECRAFT_PORT", "44819"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 CHECK_INTERVAL = 30
+HIGH_LATENCY_MS = 300
 
 state = {
     "online": False,
-    "configured": bool(HOST),
+    "configured": True,
     "players": 0,
     "max_players": 0,
     "latency": None,
-    "version": None,
-    "address": f"{HOST}:{PORT}" if HOST else None,
+    "version": "Unknown",
+    "address": f"{MINECRAFT_HOST}:{MINECRAFT_PORT}",
     "last_check": None,
     "last_change": None,
     "online_since": None,
-    "checks": 0,
-    "uptime_checks": 0,
-    "history": [],
+    "previous_players": 0,
+    "player_names": [],
+    "last_error": None,
 }
 
-state_lock = threading.Lock()
+db_ready = False
+previous_online = None
+previous_names = set()
 
 
-PAGE = """
-<!doctype html>
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def db_connect():
+    if not DATABASE_URL:
+        return None
+
+    return psycopg.connect(DATABASE_URL, connect_timeout=10)
+
+
+def init_database():
+    global db_ready
+
+    if not DATABASE_URL:
+        print("DATABASE_URL is not configured.")
+        return
+
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS checks (
+                        id BIGSERIAL PRIMARY KEY,
+                        checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        online BOOLEAN NOT NULL,
+                        players INTEGER NOT NULL DEFAULT 0,
+                        max_players INTEGER NOT NULL DEFAULT 0,
+                        latency_ms DOUBLE PRECISION,
+                        version TEXT,
+                        error TEXT
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS events (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        event_type TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        players INTEGER,
+                        latency_ms DOUBLE PRECISION
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS player_snapshots (
+                        id BIGSERIAL PRIMARY KEY,
+                        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        players INTEGER NOT NULL DEFAULT 0,
+                        player_names JSONB NOT NULL DEFAULT '[]'::jsonb
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_checks_checked_at
+                    ON checks(checked_at DESC)
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_events_created_at
+                    ON events(created_at DESC)
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_player_snapshots_captured_at
+                    ON player_snapshots(captured_at DESC)
+                """)
+
+            conn.commit()
+
+        db_ready = True
+        print("PostgreSQL database initialized.")
+
+    except Exception as e:
+        db_ready = False
+        print("Database initialization failed:", e)
+
+
+def db_execute(query, params=()):
+    if not db_ready:
+        return
+
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+            conn.commit()
+    except Exception as e:
+        print("Database error:", e)
+
+
+def save_check(data):
+    db_execute("""
+        INSERT INTO checks
+        (checked_at, online, players, max_players, latency_ms, version, error)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (
+        now_utc(),
+        data["online"],
+        data["players"],
+        data["max_players"],
+        data["latency"],
+        data["version"],
+        data["error"],
+    ))
+
+
+def save_event(event_type, message, players=None, latency=None):
+    db_execute("""
+        INSERT INTO events
+        (created_at, event_type, message, players, latency_ms)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (
+        now_utc(),
+        event_type,
+        message,
+        players,
+        latency,
+    ))
+
+
+def save_player_snapshot(names):
+    db_execute("""
+        INSERT INTO player_snapshots
+        (captured_at, players, player_names)
+        VALUES (%s, %s, %s::jsonb)
+    """, (
+        now_utc(),
+        len(names),
+        __import__("json").dumps(sorted(names)),
+    ))
+
+
+def send_discord(message):
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    try:
+        requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"content": message},
+            timeout=10,
+        )
+    except Exception as e:
+        print("Discord error:", e)
+
+
+def get_player_names(status):
+    names = set()
+
+    try:
+        sample = getattr(status.players, "sample", None)
+
+        if sample:
+            for player in sample:
+                name = getattr(player, "name", None)
+
+                if name:
+                    names.add(str(name))
+
+    except Exception:
+        pass
+
+    return names
+
+
+def minecraft_check():
+    try:
+        server = JavaServer.lookup(
+            f"{MINECRAFT_HOST}:{MINECRAFT_PORT}"
+        )
+
+        status = server.status()
+
+        latency = round(float(status.latency), 1)
+
+        version = getattr(
+            getattr(status, "version", None),
+            "name",
+            "Unknown",
+        )
+
+        players = int(
+            getattr(
+                getattr(status, "players", None),
+                "online",
+                0,
+            )
+        )
+
+        max_players = int(
+            getattr(
+                getattr(status, "players", None),
+                "max",
+                0,
+            )
+        )
+
+        names = get_player_names(status)
+
+        return {
+            "online": True,
+            "players": players,
+            "max_players": max_players,
+            "latency": latency,
+            "version": version,
+            "error": None,
+            "player_names": names,
+        }
+
+    except Exception as e:
+        return {
+            "online": False,
+            "players": 0,
+            "max_players": 0,
+            "latency": None,
+            "version": "Unknown",
+            "error": str(e),
+            "player_names": set(),
+        }
+
+
+def process_check(result):
+    global previous_online
+    global previous_names
+
+    old_online = previous_online
+    old_names = previous_names
+
+    state["online"] = result["online"]
+    state["players"] = result["players"]
+    state["max_players"] = result["max_players"]
+    state["latency"] = result["latency"]
+    state["version"] = result["version"]
+    state["last_error"] = result["error"]
+    state["last_check"] = now_utc().isoformat()
+    state["player_names"] = sorted(result["player_names"])
+
+    if old_online != result["online"]:
+        state["last_change"] = now_utc().isoformat()
+
+        if result["online"]:
+            state["online_since"] = now_utc().isoformat()
+
+            message = (
+                "Minecraft Server ONLINE\n"
+                f"Players: {result['players']}/{result['max_players']}\n"
+                f"Latency: {result['latency']} ms\n"
+                f"Version: {result['version']}"
+            )
+
+            send_discord(message)
+            save_event(
+                "online",
+                message,
+                result["players"],
+                result["latency"],
+            )
+
+        else:
+            state["online_since"] = None
+
+            message = (
+                "Minecraft Server OFFLINE\n"
+                f"Address: {MINECRAFT_HOST}:{MINECRAFT_PORT}"
+            )
+
+            send_discord(message)
+            save_event("offline", message)
+
+    elif result["online"] and old_online is True:
+        if result["players"] != state["previous_players"]:
+            message = (
+                "Player count changed\n"
+                f"Players: {result['players']}/{result['max_players']}"
+            )
+
+            send_discord(message)
+            save_event(
+                "player_count",
+                message,
+                result["players"],
+                result["latency"],
+            )
+
+        new_names = result["player_names"]
+
+        joined = new_names - old_names
+        left = old_names - new_names
+
+        for name in sorted(joined):
+            message = f"Player joined: {name}"
+            send_discord(message)
+            save_event(
+                "player_join",
+                message,
+                result["players"],
+                result["latency"],
+            )
+
+        for name in sorted(left):
+            message = f"Player left: {name}"
+            send_discord(message)
+            save_event(
+                "player_leave",
+                message,
+                result["players"],
+                result["latency"],
+            )
+
+        if (
+            result["latency"] is not None
+            and result["latency"] >= HIGH_LATENCY_MS
+        ):
+            message = (
+                "High server latency detected\n"
+                f"Latency: {result['latency']} ms"
+            )
+
+            save_event(
+                "high_latency",
+                message,
+                result["players"],
+                result["latency"],
+            )
+
+    state["previous_players"] = result["players"]
+
+    previous_online = result["online"]
+    previous_names = result["player_names"]
+
+    save_check(result)
+    save_player_snapshot(result["player_names"])
+
+
+def monitor_loop():
+    time.sleep(3)
+
+    while True:
+        try:
+            result = minecraft_check()
+            process_check(result)
+
+        except Exception as e:
+            print("Monitor loop error:", e)
+
+        time.sleep(CHECK_INTERVAL)
+
+
+def get_stats(hours):
+    if not db_ready:
+        return {
+            "database": False,
+            "hours": hours,
+            "checks": 0,
+            "online_checks": 0,
+            "uptime_percent": 0,
+            "peak_players": 0,
+            "average_latency": None,
+        }
+
+    since = now_utc() - timedelta(hours=hours)
+
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        COUNT(*),
+                        COALESCE(SUM(
+                            CASE WHEN online THEN 1 ELSE 0 END
+                        ), 0),
+                        COALESCE(MAX(players), 0),
+                        AVG(
+                            CASE
+                                WHEN online AND latency_ms IS NOT NULL
+                                THEN latency_ms
+                            END
+                        )
+                    FROM checks
+                    WHERE checked_at >= %s
+                """, (since,))
+
+                row = cur.fetchone()
+
+        checks = int(row[0] or 0)
+        online_checks = int(row[1] or 0)
+
+        uptime = (
+            round((online_checks / checks) * 100, 2)
+            if checks
+            else 0
+        )
+
+        average_latency = (
+            round(float(row[3]), 1)
+            if row[3] is not None
+            else None
+        )
+
+        return {
+            "database": True,
+            "hours": hours,
+            "checks": checks,
+            "online_checks": online_checks,
+            "uptime_percent": uptime,
+            "peak_players": int(row[2] or 0),
+            "average_latency": average_latency,
+        }
+
+    except Exception as e:
+        return {
+            "database": False,
+            "hours": hours,
+            "error": str(e),
+        }
+
+
+def get_recent_history(limit=100):
+    if not db_ready:
+        return []
+
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        checked_at,
+                        online,
+                        players,
+                        max_players,
+                        latency_ms,
+                        version
+                    FROM checks
+                    ORDER BY checked_at DESC
+                    LIMIT %s
+                """, (limit,))
+
+                rows = cur.fetchall()
+
+        return [
+            {
+                "time": row[0].isoformat(),
+                "online": row[1],
+                "players": row[2],
+                "max_players": row[3],
+                "latency": row[4],
+                "version": row[5],
+            }
+            for row in rows
+        ]
+
+    except Exception:
+        return []
+
+
+def get_recent_events(limit=50):
+    if not db_ready:
+        return []
+
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        created_at,
+                        event_type,
+                        message,
+                        players,
+                        latency_ms
+                    FROM events
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (limit,))
+
+                rows = cur.fetchall()
+
+        return [
+            {
+                "time": row[0].isoformat(),
+                "type": row[1],
+                "message": row[2],
+                "players": row[3],
+                "latency": row[4],
+            }
+            for row in rows
+        ]
+
+    except Exception:
+        return []
+
+
+@app.route("/")
+def dashboard():
+    return render_template_string("""
+<!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Niruchan Minecraft Monitor</title>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1">
+    <title>Niruchan Minecraft Monitor</title>
 
-<style>
-body {
-    font-family: system-ui, sans-serif;
-    max-width: 1000px;
-    margin: 30px auto;
-    padding: 0 18px;
-    background: #101318;
-    color: #eee;
-}
+    <style>
+        body {
+            margin: 0;
+            background: #101114;
+            color: #f1f1f1;
+            font-family: Arial, sans-serif;
+        }
 
-.card, .metric {
-    background: #191e26;
-    border: 1px solid #2b323d;
-    border-radius: 14px;
-    padding: 20px;
-    margin: 12px 0;
-}
+        .container {
+            max-width: 1100px;
+            margin: auto;
+            padding: 24px;
+        }
 
-.grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-    gap: 12px;
-}
+        h1 {
+            margin-bottom: 5px;
+        }
 
-.metric {
-    margin: 0;
-}
+        .sub {
+            color: #999;
+            margin-bottom: 25px;
+        }
 
-.muted {
-    color: #aab2bf;
-}
+        .grid {
+            display: grid;
+            grid-template-columns:
+                repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
 
-.status {
-    font-size: 32px;
-    font-weight: 800;
-}
+        .card {
+            background: #191b20;
+            border: 1px solid #2b2e35;
+            border-radius: 12px;
+            padding: 20px;
+        }
 
-.online {
-    color: #72d572;
-}
+        .label {
+            color: #999;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
 
-.offline {
-    color: #ff7777;
-}
+        .value {
+            font-size: 25px;
+            font-weight: bold;
+        }
 
-.value {
-    font-size: 22px;
-    font-weight: 700;
-    margin-top: 5px;
-}
+        .online {
+            color: #55d88a;
+        }
 
-table {
-    width: 100%;
-    border-collapse: collapse;
-}
+        .offline {
+            color: #ff6565;
+        }
 
-th, td {
-    padding: 10px;
-    border-bottom: 1px solid #2b323d;
-    text-align: left;
-}
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
 
-.small {
-    font-size: 13px;
-}
-</style>
+        th, td {
+            padding: 10px;
+            border-bottom: 1px solid #2b2e35;
+            text-align: left;
+        }
+
+        .section {
+            margin-top: 30px;
+        }
+
+        @media(max-width:600px) {
+            .container {
+                padding: 15px;
+            }
+
+            th:nth-child(5),
+            td:nth-child(5) {
+                display: none;
+            }
+        }
+    </style>
 </head>
 
 <body>
+<div class="container">
 
-<div class="card">
     <h1>Niruchan Minecraft Monitor</h1>
 
-    <div id="status" class="status">
-        Checking...
+    <div class="sub">
+        Live monitoring and server analytics
     </div>
 
-    <p id="address" class="muted"></p>
-    <p id="lastCheck" class="muted"></p>
+    <div class="grid">
+
+        <div class="card">
+            <div class="label">STATUS</div>
+            <div id="status" class="value">Loading...</div>
+        </div>
+
+        <div class="card">
+            <div class="label">PLAYERS</div>
+            <div id="players" class="value">-</div>
+        </div>
+
+        <div class="card">
+            <div class="label">LATENCY</div>
+            <div id="latency" class="value">-</div>
+        </div>
+
+        <div class="card">
+            <div class="label">VERSION</div>
+            <div id="version" class="value">-</div>
+        </div>
+
+        <div class="card">
+            <div class="label">DATABASE</div>
+            <div id="database" class="value">-</div>
+        </div>
+
+        <div class="card">
+            <div class="label">LAST CHECK</div>
+            <div id="lastcheck" class="value"
+                 style="font-size:15px">-</div>
+        </div>
+
+    </div>
+
+    <div class="section">
+        <h2>Statistics</h2>
+
+        <div class="grid">
+
+            <div class="card">
+                <div class="label">24H UPTIME</div>
+                <div id="uptime24" class="value">-</div>
+            </div>
+
+            <div class="card">
+                <div class="label">7D UPTIME</div>
+                <div id="uptime168" class="value">-</div>
+            </div>
+
+            <div class="card">
+                <div class="label">30D UPTIME</div>
+                <div id="uptime720" class="value">-</div>
+            </div>
+
+            <div class="card">
+                <div class="label">24H PEAK PLAYERS</div>
+                <div id="peak24" class="value">-</div>
+            </div>
+
+            <div class="card">
+                <div class="label">24H AVG LATENCY</div>
+                <div id="avgping" class="value">-</div>
+            </div>
+
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Recent Events</h2>
+
+        <div class="card">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Type</th>
+                        <th>Message</th>
+                    </tr>
+                </thead>
+
+                <tbody id="events">
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Monitoring History</h2>
+
+        <div class="card">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Status</th>
+                        <th>Players</th>
+                        <th>Latency</th>
+                        <th>Version</th>
+                    </tr>
+                </thead>
+
+                <tbody id="history">
+                </tbody>
+            </table>
+        </div>
+    </div>
+
 </div>
-
-
-<div class="grid">
-
-    <div class="metric">
-        <div class="muted">Players</div>
-        <div id="players" class="value">—</div>
-    </div>
-
-    <div class="metric">
-        <div class="muted">Latency</div>
-        <div id="latency" class="value">—</div>
-    </div>
-
-    <div class="metric">
-        <div class="muted">Version</div>
-        <div id="version" class="value">—</div>
-    </div>
-
-    <div class="metric">
-        <div class="muted">Uptime</div>
-        <div id="uptime" class="value">—</div>
-    </div>
-
-    <div class="metric">
-        <div class="muted">Total Checks</div>
-        <div id="checks" class="value">—</div>
-    </div>
-
-    <div class="metric">
-        <div class="muted">Online Checks</div>
-        <div id="onlineChecks" class="value">—</div>
-    </div>
-
-</div>
-
-
-<div class="card">
-
-    <h2>Recent History</h2>
-
-    <table>
-        <thead>
-            <tr>
-                <th>Time</th>
-                <th>Status</th>
-                <th>Players</th>
-                <th>Latency</th>
-            </tr>
-        </thead>
-
-        <tbody id="history"></tbody>
-    </table>
-
-</div>
-
 
 <script>
-
-function formatUptime(seconds) {
-
-    if (!seconds) {
-        return "—";
-    }
-
-    seconds = Math.floor(seconds);
-
-    const days = Math.floor(seconds / 86400);
-    seconds %= 86400;
-
-    const hours = Math.floor(seconds / 3600);
-    seconds %= 3600;
-
-    const minutes = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-
-    let result = "";
-
-    if (days) {
-        result += days + "d ";
-    }
-
-    if (hours) {
-        result += hours + "h ";
-    }
-
-    if (minutes) {
-        result += minutes + "m ";
-    }
-
-    result += secs + "s";
-
-    return result;
-}
-
-
-async function updateDashboard() {
-
+async function update() {
     try {
+        const status = await fetch("/api/status")
+            .then(r => r.json());
 
-        const response = await fetch(
-            "/api/status?_=" + Date.now()
-        );
+        const stats24 = await fetch("/api/stats?hours=24")
+            .then(r => r.json());
 
-        const data = await response.json();
+        const stats168 = await fetch("/api/stats?hours=168")
+            .then(r => r.json());
 
-        const status =
-            document.getElementById("status");
+        const stats720 = await fetch("/api/stats?hours=720")
+            .then(r => r.json());
 
-        status.textContent =
-            data.online ? "ONLINE" : "OFFLINE";
+        const events = await fetch("/api/events")
+            .then(r => r.json());
 
-        status.className =
-            "status " +
-            (data.online ? "online" : "offline");
+        const history = await fetch("/api/history")
+            .then(r => r.json());
 
+        const statusEl = document.getElementById("status");
 
-        document.getElementById("address")
-            .textContent =
-            data.address || "Not configured";
+        statusEl.textContent =
+            status.online ? "ONLINE" : "OFFLINE";
 
+        statusEl.className =
+            "value " +
+            (status.online ? "online" : "offline");
 
         document.getElementById("players")
             .textContent =
-            data.online
-                ? data.players.online +
-                  " / " +
-                  data.players.max
-                : "—";
-
+            status.players + " / " + status.max_players;
 
         document.getElementById("latency")
             .textContent =
-            data.online
-                ? Math.round(data.latency) + " ms"
-                : "—";
-
+            status.latency == null
+            ? "-"
+            : status.latency + " ms";
 
         document.getElementById("version")
+            .textContent = status.version;
+
+        document.getElementById("database")
             .textContent =
-            data.version || "—";
+            status.database ? "CONNECTED" : "OFFLINE";
 
-
-        document.getElementById("checks")
+        document.getElementById("lastcheck")
             .textContent =
-            data.checks;
+            status.last_check || "-";
 
-
-        document.getElementById("onlineChecks")
+        document.getElementById("uptime24")
             .textContent =
-            data.uptime_checks;
+            stats24.uptime_percent + "%";
 
-
-        document.getElementById("uptime")
+        document.getElementById("uptime168")
             .textContent =
-            formatUptime(data.uptime_seconds);
+            stats168.uptime_percent + "%";
 
+        document.getElementById("uptime720")
+            .textContent =
+            stats720.uptime_percent + "%";
 
-        if (data.last_check) {
+        document.getElementById("peak24")
+            .textContent =
+            stats24.peak_players;
 
-            document.getElementById("lastCheck")
-                .textContent =
-                "Last check: " +
-                new Date(
-                    data.last_check
-                ).toLocaleString();
+        document.getElementById("avgping")
+            .textContent =
+            stats24.average_latency == null
+            ? "-"
+            : stats24.average_latency + " ms";
 
-        }
+        document.getElementById("events").innerHTML =
+            events.map(e => `
+                <tr>
+                    <td>${e.time}</td>
+                    <td>${e.type}</td>
+                    <td>${e.message}</td>
+                </tr>
+            `).join("");
 
-
-        const history =
-            document.getElementById("history");
-
-        history.innerHTML = "";
-
-
-        for (const item of data.history) {
-
-            const row =
-                document.createElement("tr");
-
-            row.innerHTML =
-                "<td class='small'>" +
-                new Date(
-                    item.time
-                ).toLocaleString() +
-                "</td>" +
-
-                "<td>" +
-                (item.online
-                    ? "ONLINE"
-                    : "OFFLINE") +
-                "</td>" +
-
-                "<td>" +
-                (item.online
-                    ? item.players
-                    : "—") +
-                "</td>" +
-
-                "<td>" +
-                (item.online
-                    ? Math.round(item.latency) +
-                      " ms"
-                    : "—") +
-                "</td>";
-
-            history.appendChild(row);
-        }
+        document.getElementById("history").innerHTML =
+            history.map(h => `
+                <tr>
+                    <td>${h.time}</td>
+                    <td>
+                        ${h.online ? "ONLINE" : "OFFLINE"}
+                    </td>
+                    <td>
+                        ${h.players}/${h.max_players}
+                    </td>
+                    <td>
+                        ${h.latency == null
+                            ? "-"
+                            : h.latency + " ms"}
+                    </td>
+                    <td>${h.version}</td>
+                </tr>
+            `).join("");
 
     } catch (error) {
-
-        const status =
-            document.getElementById("status");
-
-        status.textContent = "ERROR";
-        status.className = "status offline";
+        console.error(error);
     }
 }
 
-
-updateDashboard();
-
-setInterval(
-    updateDashboard,
-    30000
-);
-
+update();
+setInterval(update, 30000);
 </script>
 
 </body>
 </html>
-"""
+""")
 
 
-def send_discord(message):
-
-    if not DISCORD_WEBHOOK:
-        return
-
-    try:
-
-        requests.post(
-            DISCORD_WEBHOOK,
-            json={
-                "content": message
-            },
-            timeout=8
-        )
-
-    except Exception:
-
-        pass
-
-
-def minecraft_check():
-
-    if not HOST:
-
-        return {
-            "online": False,
-            "players": 0,
-            "max_players": 0,
-            "latency": None,
-            "version": None,
-        }
-
-    try:
-
-        server = JavaServer(
-            HOST,
-            PORT,
-            timeout=4
-        )
-
-        result = server.status()
-
-        return {
-            "online": True,
-            "players": result.players.online,
-            "max_players": result.players.max,
-            "latency": result.latency,
-            "version": getattr(
-                result.version,
-                "name",
-                None
-            ),
-        }
-
-    except Exception:
-
-        return {
-            "online": False,
-            "players": 0,
-            "max_players": 0,
-            "latency": None,
-            "version": None,
-        }
-
-
-def monitor_loop():
-
-    while True:
-
-        try:
-
-            result = minecraft_check()
-
-            now = datetime.now(
-                timezone.utc
-            ).isoformat()
-
-            should_alert = False
-            alert_message = ""
-
-            with state_lock:
-
-                previous = state["online"]
-
-                state["online"] = result["online"]
-                state["players"] = result["players"]
-                state["max_players"] = result["max_players"]
-                state["latency"] = result["latency"]
-                state["version"] = result["version"]
-                state["last_check"] = now
-                state["checks"] += 1
-
-                if result["online"]:
-                    state["uptime_checks"] += 1
-
-
-                if previous != result["online"]:
-
-                    state["last_change"] = now
-
-                    if result["online"]:
-
-                        state["online_since"] = now
-
-                        should_alert = True
-
-                        alert_message = (
-                            "🟢 **Mahal Series is ONLINE**\n"
-                            f"Players: "
-                            f"{result['players']}/"
-                            f"{result['max_players']}\n"
-                            f"Latency: "
-                            f"{round(result['latency'])} ms"
-                        )
-
-                    else:
-
-                        state["online_since"] = None
-
-                        should_alert = True
-
-                        alert_message = (
-                            "🔴 **Mahal Series is OFFLINE**"
-                        )
-
-
-                state["history"].insert(
-                    0,
-                    {
-                        "time": now,
-                        "online": result["online"],
-                        "players": result["players"],
-                        "latency": result["latency"],
-                    }
-                )
-
-                state["history"] = \
-                    state["history"][:50]
-
-
-            if should_alert:
-
-                send_discord(
-                    alert_message
-                )
-
-        except Exception:
-
-            pass
-
-        time.sleep(
-            CHECK_INTERVAL
-        )
-
-
-@app.get("/")
-def home():
-
-    return render_template_string(PAGE)
-
-
-@app.get("/health")
-def health():
-
+@app.route("/api/status")
+def api_status():
     return jsonify({
-        "ok": True
+        **state,
+        "database": db_ready,
+        "host": MINECRAFT_HOST,
+        "port": MINECRAFT_PORT,
     })
 
 
-@app.get("/api/status")
-def api_status():
-
-    with state_lock:
-
-        data = dict(state)
-
-        data["history"] = list(
-            state["history"]
-        )
-
-        if (
-            state["online"]
-            and state["online_since"]
-        ):
-
-            started = datetime.fromisoformat(
-                state["online_since"]
-            )
-
-            now = datetime.now(
-                timezone.utc
-            )
-
-            data["uptime_seconds"] = (
-                now - started
-            ).total_seconds()
-
-        else:
-
-            data["uptime_seconds"] = 0
-
-        return jsonify(data)
+@app.route("/api/history")
+def api_history():
+    return jsonify(get_recent_history())
 
 
-@app.get("/api/check")
-def api_check():
+@app.route("/api/events")
+def api_events():
+    return jsonify(get_recent_events())
 
-    if SECRET:
 
-        provided_secret = request.headers.get(
-            "X-Dashboard-Secret",
-            ""
-        )
+@app.route("/api/stats")
+def api_stats():
+    try:
+        hours = int(__import__("flask").request.args.get(
+            "hours",
+            "24"
+        ))
+    except ValueError:
+        hours = 24
 
-        if provided_secret != SECRET:
+    hours = max(1, min(hours, 720))
 
-            return jsonify({
-                "error": "unauthorized"
-            }), 401
+    return jsonify(get_stats(hours))
 
-    return jsonify(
-        minecraft_check()
-    )
+
+@app.route("/api/players")
+def api_players():
+    return jsonify({
+        "online": state["online"],
+        "count": state["players"],
+        "max": state["max_players"],
+        "names": state["player_names"],
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "database": db_ready,
+        "minecraft": state["online"],
+        "time": now_utc().isoformat(),
+    })
 
 
 def start_monitor():
-
     thread = threading.Thread(
         target=monitor_loop,
-        daemon=True
+        daemon=True,
+        name="minecraft-monitor",
     )
-
     thread.start()
 
 
+init_database()
 start_monitor()
 
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.getenv("PORT", "10000")
-        )
+        port=int(os.getenv("PORT", "10000")),
     )
