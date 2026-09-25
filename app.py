@@ -18,6 +18,8 @@ VERIFY_ATTEMPTS = max(1, int(os.getenv('VERIFY_ATTEMPTS', '3')))
 VERIFY_DELAY = max(1, float(os.getenv('VERIFY_DELAY', '2')))
 HIGH_LATENCY = float(os.getenv('HIGH_LATENCY_MS', '300'))
 ALERT_COOLDOWN = max(60, int(os.getenv('ALERT_COOLDOWN_SECONDS', '900')))
+REPORT_HOUR_UTC = int(os.getenv('DAILY_REPORT_HOUR_UTC', '18'))
+REPORT_MINUTE_UTC = int(os.getenv('DAILY_REPORT_MINUTE_UTC', '30'))
 
 lock = threading.Lock()
 state = {
@@ -31,6 +33,7 @@ state = {
 previous_names = set()
 previous_online = False
 last_alert = {}
+last_daily_report_date = None
 db_ready = False
 recent_samples = deque(maxlen=500)
 
@@ -51,9 +54,12 @@ def init_db():
                 x.execute('''CREATE TABLE IF NOT EXISTS checks (id BIGSERIAL PRIMARY KEY, checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), online BOOLEAN NOT NULL, players INT NOT NULL DEFAULT 0, max_players INT NOT NULL DEFAULT 0, latency_ms DOUBLE PRECISION, version TEXT, protocol INT, motd TEXT, error TEXT, success_attempt INT)''')
                 x.execute('''CREATE TABLE IF NOT EXISTS events (id BIGSERIAL PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), event_type TEXT NOT NULL, message TEXT NOT NULL, players INT, latency_ms DOUBLE PRECISION, metadata JSONB NOT NULL DEFAULT '{}'::jsonb)''')
                 x.execute('''CREATE TABLE IF NOT EXISTS player_snapshots (id BIGSERIAL PRIMARY KEY, captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), players INT NOT NULL DEFAULT 0, player_names JSONB NOT NULL DEFAULT '[]'::jsonb)''')
+                x.execute('''CREATE TABLE IF NOT EXISTS player_sessions (id BIGSERIAL PRIMARY KEY, player_name TEXT NOT NULL, joined_at TIMESTAMPTZ NOT NULL, left_at TIMESTAMPTZ, duration_seconds DOUBLE PRECISION)''')
+                x.execute('''CREATE TABLE IF NOT EXISTS daily_reports (report_date DATE PRIMARY KEY, generated_at TIMESTAMPTZ NOT NULL, delivered BOOLEAN NOT NULL DEFAULT FALSE, payload JSONB NOT NULL DEFAULT '{}'::jsonb)''')
                 x.execute('''CREATE TABLE IF NOT EXISTS downtime (id BIGSERIAL PRIMARY KEY, started_at TIMESTAMPTZ NOT NULL, ended_at TIMESTAMPTZ, reason TEXT)''')
                 x.execute('CREATE INDEX IF NOT EXISTS idx_checks_time ON checks(checked_at DESC)')
                 x.execute('CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at DESC)')
+                x.execute('CREATE INDEX IF NOT EXISTS idx_sessions_player_time ON player_sessions(player_name,joined_at DESC)')
             c.commit()
         db_ready = True
     except Exception as e: print('DB init failed:', e)
@@ -69,19 +75,21 @@ def db_exec(q, p=()):
 def event(kind, msg, players=None, latency=None, meta=None):
     db_exec('INSERT INTO events(created_at,event_type,message,players,latency_ms,metadata) VALUES(%s,%s,%s,%s,%s,%s::jsonb)', (now(),kind,msg,players,latency,json.dumps(meta or {})))
 
-def discord(content):
+def discord_embed(title, description='', color=0x5865F2, fields=None):
     if not WEBHOOK: return False
+    embed={'title':title,'description':description,'color':color,'timestamp':now().isoformat(),'footer':{'text':'Mahal Series Monitor'}}
+    if fields: embed['fields']=[{'name':str(n),'value':str(v),'inline':bool(i)} for n,v,i in fields]
     try:
-        r = requests.post(WEBHOOK, json={'content': content}, timeout=8)
+        r=requests.post(WEBHOOK,json={'embeds':[embed]},timeout=8)
         return 200 <= r.status_code < 300
     except Exception as e:
-        print('Discord error:', e); return False
+        print('Discord error:',e); return False
 
-def alert(kind, msg, force=False):
-    t = time.time()
-    if not force and t - last_alert.get(kind, 0) < ALERT_COOLDOWN: return False
-    ok = discord(msg)
-    if ok: last_alert[kind] = t
+def alert(kind,title,description='',color=0x5865F2,fields=None,force=False):
+    t=time.time()
+    if not force and t-last_alert.get(kind,0)<ALERT_COOLDOWN: return False
+    ok=discord_embed(title,description,color,fields)
+    if ok: last_alert[kind]=t
     return ok
 
 def sample_status():
@@ -126,6 +134,12 @@ def verified_check():
         return result
     return {'online': False,'players':0,'max_players':0,'latency':None,'version':'Unknown','protocol':None,'motd':'','names':set(),'error': errors[-1] if errors else 'verification failed','success_attempt':None,'verification': {'attempts': VERIFY_ATTEMPTS,'successes':0,'failures':len(errors)}}
 
+def open_session(name,ts):
+    db_exec('INSERT INTO player_sessions(player_name,joined_at) VALUES(%s,%s)',(name,ts))
+
+def close_session(name,ts):
+    db_exec('''UPDATE player_sessions SET left_at=%s,duration_seconds=EXTRACT(EPOCH FROM (%s-joined_at)) WHERE id=(SELECT id FROM player_sessions WHERE player_name=%s AND left_at IS NULL ORDER BY joined_at DESC LIMIT 1)''',(ts,ts,name))
+
 def process(r):
     global previous_names, previous_online
     with lock:
@@ -142,32 +156,61 @@ def process(r):
             state['last_change']=iso(ts)
             if r['online']:
                 state['online_since']=iso(ts); state['downtime_since']=None
-                alert('online', f'🟢 **MAHAL SERIES — ONLINE**\nPlayers: `{r["players"]}/{r["max_players"]}`\nPing: `{r["latency"]} ms`\nVersion: `{r["version"]}`\nVerified: `{r["verification"]["successes"]}/{r["verification"]["attempts"]}`\nAddress: `{HOST}:{PORT}`', force=True)
+                alert('online','🟢 MAHAL SERIES — ONLINE','Minecraft status verified successfully.',0x57F287,[('Players',f"{r['players']}/{r['max_players']}",True),('Ping',f"{r['latency']} ms",True),('Version',r['version'],True),('Verification',f"{r['verification']['successes']}/{r['verification']['attempts']}",True),('Address',f'{HOST}:{PORT}',False)],force=True)
                 event('online','Server verified ONLINE',r['players'],r['latency'])
                 db_exec('UPDATE downtime SET ended_at=%s WHERE ended_at IS NULL',(ts,))
             else:
                 state['downtime_since']=iso(ts); state['online_since']=None
-                alert('offline', f'🔴 **MAHAL SERIES — OFFLINE**\nVerification: `{r["verification"]["attempts"]}/{r["verification"]["attempts"]} failed`\nLast successful check: `{state.get("last_success")}`\nAddress: `{HOST}:{PORT}`\nError: `{r["error"]}`', force=True)
+                alert('offline','🔴 MAHAL SERIES — OFFLINE','Server failed all verification attempts.',0xED4245,[('Verification',f"{r['verification']['successes']}/{r['verification']['attempts']} successful",True),('Last success',state.get('last_success') or 'None',False),('Address',f'{HOST}:{PORT}',False),('Reason',r['error'] or 'Unknown',False)],force=True)
                 event('offline','Server verified OFFLINE',0,None,{'error':r['error']})
                 db_exec('INSERT INTO downtime(started_at,reason) VALUES(%s,%s)',(ts,r['error']))
         elif r['online'] and old_online:
             joined=r['names']-old_names; left=old_names-r['names']
             for n in sorted(joined):
-                alert('join:'+n, f'🟢 **Player joined** `{n}`\nPlayers: `{r["players"]}/{r["max_players"]}`', force=True); event('player_join',f'Player joined: {n}',r['players'],r['latency'])
+                alert('join:'+n,'👤 PLAYER JOINED',f'`{n}` joined Mahal Series.',0x57F287,[('Players',f"{r['players']}/{r['max_players']}",True),('Ping',f"{r['latency']} ms",True)],force=True); event('player_join',f'Player joined: {n}',r['players'],r['latency']); open_session(n,ts)
             for n in sorted(left):
-                alert('leave:'+n, f'🔵 **Player left** `{n}`\nPlayers: `{r["players"]}/{r["max_players"]}`', force=True); event('player_leave',f'Player left: {n}',r['players'],r['latency'])
+                alert('leave:'+n,'👋 PLAYER LEFT',f'`{n}` left Mahal Series.',0x5865F2,[('Players',f"{r['players']}/{r['max_players']}",True),('Ping',f"{r['latency']} ms",True)],force=True); event('player_leave',f'Player left: {n}',r['players'],r['latency']); close_session(n,ts)
             if r['latency'] is not None and r['latency'] >= HIGH_LATENCY:
                 msg=f'🟡 **HIGH LATENCY**\nPing: `{r["latency"]} ms`\nPlayers: `{r["players"]}/{r["max_players"]}`'
-                alert('high_latency',msg); event('high_latency',msg,r['players'],r['latency'])
+                alert('high_latency','🟡 HIGH LATENCY',msg,0xFEE75C,[('Ping',f"{r['latency']} ms",True),('Players',f"{r['players']}/{r['max_players']}",True)]); event('high_latency',msg,r['players'],r['latency'])
         previous_online=r['online']; previous_names=r['names']
         recent_samples.append({'time':iso(ts),'online':r['online'],'players':r['players'],'latency':r['latency']})
     db_exec('INSERT INTO checks(checked_at,online,players,max_players,latency_ms,version,protocol,motd,error,success_attempt) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(ts,r['online'],r['players'],r['max_players'],r['latency'],r['version'],r['protocol'],r['motd'],r['error'],r.get('success_attempt')))
     db_exec('INSERT INTO player_snapshots(captured_at,players,player_names) VALUES(%s,%s,%s::jsonb)',(ts,r['players'],json.dumps(sorted(r['names']))))
 
+def format_duration(sec):
+    sec=max(0,int(sec)); d,rem=divmod(sec,86400); h,rem=divmod(rem,3600); m,s=divmod(rem,60)
+    return ' '.join(([f'{d}d'] if d else [])+([f'{h}h'] if h else [])+([f'{m}m'] if m else [])+([f'{s}s'] if s or not (d or h or m) else []))
+
+def send_daily_report(day):
+    end=datetime(day.year,day.month,day.day,tzinfo=timezone.utc)+timedelta(days=1); start=end-timedelta(days=1)
+    if not db_ready:return False
+    try:
+        with db_connect() as c:
+            with c.cursor() as x:
+                x.execute('SELECT COUNT(*),COALESCE(SUM(CASE WHEN online THEN 1 ELSE 0 END),0),COALESCE(MAX(players),0),AVG(CASE WHEN online THEN latency_ms END) FROM checks WHERE checked_at >= %s AND checked_at < %s',(start,end)); a=x.fetchone()
+                x.execute('SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(ended_at,%s)-started_at)),0),0) FROM downtime WHERE started_at < %s AND (ended_at IS NULL OR ended_at > %s)',(end,end,start)); down=float(x.fetchone()[0] or 0)
+                counts={}
+                for typ in ('player_join','player_leave','high_latency'):
+                    x.execute('SELECT COUNT(*) FROM events WHERE created_at >= %s AND created_at < %s AND event_type=%s',(start,end,typ)); counts[typ]=int(x.fetchone()[0] or 0)
+        checks=int(a[0] or 0); online=int(a[1] or 0); uptime=round(online/checks*100,2) if checks else 0
+        fields=[('Uptime',f'{uptime}%',True),('Downtime',format_duration(down),True),('Peak players',int(a[2] or 0),True),('Average ping',f'{round(float(a[3]),1)} ms' if a[3] is not None else '—',True),('Joins',counts['player_join'],True),('Leaves',counts['player_leave'],True),('High latency',counts['high_latency'],True),('Checks',checks,True)]
+        delivered=discord_embed('📊 MAHAL SERIES — DAILY REPORT',f'Daily report for **{day.isoformat()} UTC**\n`{HOST}:{PORT}`',0x5865F2,fields)
+        db_exec('INSERT INTO daily_reports(report_date,generated_at,delivered,payload) VALUES(%s,%s,%s,%s::jsonb) ON CONFLICT(report_date) DO UPDATE SET generated_at=EXCLUDED.generated_at,delivered=EXCLUDED.delivered,payload=EXCLUDED.payload',(day,now(),delivered,json.dumps({'uptime_percent':uptime,'downtime_seconds':down})))
+        return delivered
+    except Exception as e:
+        print('Daily report error:',e); return False
+
+def maybe_daily_report():
+    global last_daily_report_date
+    t=now(); target=(t-timedelta(days=1)).date()
+    if t.hour==REPORT_HOUR_UTC and t.minute>=REPORT_MINUTE_UTC and last_daily_report_date!=target:
+        send_daily_report(target); last_daily_report_date=target
+
 def monitor():
     time.sleep(2)
     while True:
-        try: process(verified_check())
+        try: process(verified_check()); maybe_daily_report()
         except Exception as e: print('Monitor:',e)
         time.sleep(INTERVAL)
 
@@ -195,7 +238,7 @@ def dashboard():
     return render_template_string(HTML, host=HOST, port=PORT, interval=INTERVAL)
 @app.route('/api/status')
 def api_status():
-    with lock: return jsonify({**state,'database':db_ready,'host':HOST,'port':PORT,'alerting':bool(WEBHOOK)})
+    with lock: return jsonify({**state,'database':db_ready,'host':HOST,'port':PORT,'alerting':bool(WEBHOOK),'daily_report_utc':f'{REPORT_HOUR_UTC:02d}:{REPORT_MINUTE_UTC:02d}'})
 @app.route('/api/stats')
 def api_stats():
     try:h=max(1,min(720,int(request.args.get('hours',24))))
@@ -213,6 +256,17 @@ def api_events():
 @app.route('/api/players')
 def api_players():
     with lock:return jsonify({'online':state['online'],'count':state['players'],'max':state['max_players'],'names':state['player_names']})
+
+@app.route('/api/sessions')
+def api_sessions():
+    r=rows('SELECT player_name,joined_at,left_at,duration_seconds FROM player_sessions ORDER BY joined_at DESC LIMIT 200')
+    return jsonify([{'player':a,'joined':iso(b),'left':iso(c),'duration_seconds':d} for a,b,c,d in r])
+
+@app.route('/api/daily-reports')
+def api_daily_reports():
+    r=rows('SELECT report_date,generated_at,delivered,payload FROM daily_reports ORDER BY report_date DESC LIMIT 30')
+    return jsonify([{'date':str(a),'generated_at':iso(b),'delivered':c,'payload':d} for a,b,c,d in r])
+
 @app.route('/api/report')
 def api_report(): return jsonify({'generated_at':iso(now()),'24h':stats(24),'7d':stats(168),'30d':stats(720)})
 @app.route('/health')
