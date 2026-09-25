@@ -92,10 +92,21 @@ def sample_status():
     for pl in (getattr(p, 'sample', None) or []):
         n = getattr(pl, 'name', None)
         if n: names.add(str(n))
-    ver = getattr(getattr(s, 'version', None), 'name', 'Unknown')
+    ver = str(getattr(getattr(s, 'version', None), 'name', 'Unknown') or 'Unknown')
     protocol = getattr(getattr(s, 'version', None), 'protocol', None)
     motd = str(getattr(s, 'description', '') or '')
-    return {'online': True, 'players': int(getattr(p, 'online', 0) or 0), 'max_players': int(getattr(p, 'max', 0) or 0), 'latency': round(float(s.latency),1), 'version': str(ver), 'protocol': protocol, 'motd': motd, 'names': names, 'error': None}
+
+    # Some hosting/proxy layers can answer the status query with a synthetic
+    # version such as "§c● Offline" even though a TCP/status response was
+    # received. That is NOT a real Minecraft ONLINE state. Treat these
+    # provider-generated offline markers as verification failures.
+    normalized_ver = ver.replace('§', '').replace('●', ' ').strip().lower()
+    offline_markers = ('offline', 'server offline', 'not online', 'starting', 'stopping')
+    if any(marker in normalized_ver for marker in offline_markers):
+        raise ConnectionError(f'Provider reported server offline: {ver}')
+
+    latency = round(float(s.latency), 1)
+    return {'online': True, 'players': int(getattr(p, 'online', 0) or 0), 'max_players': int(getattr(p, 'max', 0) or 0), 'latency': latency, 'version': ver, 'protocol': protocol, 'motd': motd, 'names': names, 'error': None}
 
 def verified_check():
     successes=[]; errors=[]
