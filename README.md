@@ -1,77 +1,19 @@
-# Niruchan Minecraft Monitor
+# Niruchan Minecraft Control Center V4 Ultra
 
-Render-ready Minecraft Java server monitoring dashboard.
+Features: verified Minecraft status checks, false-online protection, Discord alerts with cooldown/deduplication, player join/leave detection, latency alerts, PostgreSQL history, downtime tracking, analytics API, and dashboard.
 
-## Features
+Render start command:
+`gunicorn --bind 0.0.0.0:$PORT app:app`
 
-- Online/offline status
-- Player count
-- Server latency
-- Minecraft version
-- JSON status API
-- Health endpoint
-- Optional protected API endpoint
-- Render deployment configuration
+Environment variables:
+- MINECRAFT_HOST
+- MINECRAFT_PORT
+- DATABASE_URL
+- DISCORD_WEBHOOK_URL
+- CHECK_INTERVAL (default 30)
+- VERIFY_ATTEMPTS (default 3)
+- VERIFY_DELAY (default 2)
+- HIGH_LATENCY_MS (default 300)
+- ALERT_COOLDOWN_SECONDS (default 900)
 
-## Environment Variables
-
-### MINECRAFT_HOST
-
-Minecraft server hostname or IP.
-
-Example:
-
-yourserver.example.com
-
-### MINECRAFT_PORT
-
-Minecraft Java server port.
-
-Default:
-
-25565
-
-### DASHBOARD_SECRET
-
-Optional secret used to protect `/api/check`.
-
-## API Endpoints
-
-### Dashboard
-
-/
-
-### Health
-
-/health
-
-### Server Status
-
-/api/status
-
-### Protected Server Status
-
-/api/check
-
-If `DASHBOARD_SECRET` is configured, `/api/check`
-requires the `X-Dashboard-Secret` HTTP header.
-
-## Important
-
-This project monitors a Minecraft server.
-
-It cannot automatically start or stop an arbitrary Minecraft
-server unless the Minecraft hosting provider provides an
-official control API that can be safely integrated.
-
-## Deployment
-
-This project is designed for a Render Python Web Service.
-
-Build command:
-
-pip install -r requirements.txt
-
-Start command:
-
-gunicorn --bind 0.0.0.0:$PORT app:app
+Never commit secrets to GitHub.
