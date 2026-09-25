@@ -1,4 +1,4 @@
-import os, time, json, threading
+import os, time, json, threading, socket
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
@@ -16,6 +16,7 @@ WEBHOOK = os.getenv('DISCORD_WEBHOOK_URL')
 INTERVAL = max(15, int(os.getenv('CHECK_INTERVAL', '30')))
 VERIFY_ATTEMPTS = max(1, int(os.getenv('VERIFY_ATTEMPTS', '3')))
 VERIFY_DELAY = max(1, float(os.getenv('VERIFY_DELAY', '2')))
+MC_TIMEOUT = max(5.0, float(os.getenv('MC_STATUS_TIMEOUT', '10')))
 HIGH_LATENCY = float(os.getenv('HIGH_LATENCY_MS', '300'))
 ALERT_COOLDOWN = max(60, int(os.getenv('ALERT_COOLDOWN_SECONDS', '900')))
 OFFLINE_CONFIRMATION_CYCLES = max(1, int(os.getenv('OFFLINE_CONFIRMATION_CYCLES', '3')))
@@ -94,9 +95,29 @@ def alert(kind,title,description='',color=0x5865F2,fields=None,force=False):
     if ok: last_alert[kind]=t
     return ok
 
+def tcp_probe(timeout=5.0):
+    started = time.perf_counter()
+    with socket.create_connection((HOST, PORT), timeout=timeout):
+        return round((time.perf_counter() - started) * 1000, 1)
+
 def sample_status():
-    server = JavaServer.lookup(f'{HOST}:{PORT}')
-    s = server.status()
+    # Give Aternos/proxy connections more time than mcstatus' 3s default.
+    # lookup() itself also performs Java SRV resolution when appropriate.
+    server = JavaServer.lookup(f'{HOST}:{PORT}', timeout=MC_TIMEOUT)
+    try:
+        s = server.status(tries=2)
+    except Exception as status_error:
+        # A reachable Minecraft TCP endpoint can occasionally fail to answer
+        # the status packet in time. Do NOT call that OFFLINE when the port is
+        # demonstrably reachable; retain the last known status and mark this
+        # sample as degraded.
+        tcp_latency = tcp_probe(timeout=min(MC_TIMEOUT, 6.0))
+        return {'online': True, 'players': None, 'max_players': None,
+                'latency': tcp_latency, 'version': 'Reachable / status timeout',
+                'protocol': None, 'motd': '', 'names': set(),
+                'error': f'Minecraft status timeout; TCP reachable: {status_error}',
+                'degraded': True}
+
     p = getattr(s, 'players', None)
     names = set()
     for pl in (getattr(p, 'sample', None) or []):
@@ -106,17 +127,13 @@ def sample_status():
     protocol = getattr(getattr(s, 'version', None), 'protocol', None)
     motd = str(getattr(s, 'description', '') or '')
 
-    # Some hosting/proxy layers can answer the status query with a synthetic
-    # version such as "§c● Offline" even though a TCP/status response was
-    # received. That is NOT a real Minecraft ONLINE state. Treat these
-    # provider-generated offline markers as verification failures.
     normalized_ver = ver.replace('§', '').replace('●', ' ').strip().lower()
     offline_markers = ('offline', 'server offline', 'not online', 'starting', 'stopping')
     if any(marker in normalized_ver for marker in offline_markers):
         raise ConnectionError(f'Provider reported server offline: {ver}')
 
     latency = round(float(s.latency), 1)
-    return {'online': True, 'players': int(getattr(p, 'online', 0) or 0), 'max_players': int(getattr(p, 'max', 0) or 0), 'latency': latency, 'version': ver, 'protocol': protocol, 'motd': motd, 'names': names, 'error': None}
+    return {'online': True, 'players': int(getattr(p, 'online', 0) or 0), 'max_players': int(getattr(p, 'max', 0) or 0), 'latency': latency, 'version': ver, 'protocol': protocol, 'motd': motd, 'names': names, 'error': None, 'degraded': False}
 
 def verified_check():
     successes=[]; errors=[]
@@ -156,15 +173,26 @@ def process(r):
             state['consecutive_failures'] = 0
             state['consecutive_successes'] += 1
             state['has_seen_success'] = True
-            state.update({
-                'online': True, 'confirmed': True,
-                'players': r['players'], 'max_players': r['max_players'],
-                'latency': r['latency'], 'version': r['version'],
-                'protocol': r['protocol'], 'motd': r['motd'],
-                'player_names': sorted(r['names']),
-                'last_check': iso(ts), 'last_error': None,
-                'last_success': iso(ts)
-            })
+            if r.get('degraded'):
+                # Keep the last good Minecraft metadata during a status-packet
+                # timeout. TCP reachability proves the endpoint is still alive.
+                state.update({
+                    'online': True, 'confirmed': True,
+                    'latency': r['latency'],
+                    'last_check': iso(ts),
+                    'last_error': r.get('error'),
+                    'last_success': state.get('last_success') or iso(ts)
+                })
+            else:
+                state.update({
+                    'online': True, 'confirmed': True,
+                    'players': r['players'], 'max_players': r['max_players'],
+                    'latency': r['latency'], 'version': r['version'],
+                    'protocol': r['protocol'], 'motd': r['motd'],
+                    'player_names': sorted(r['names']),
+                    'last_check': iso(ts), 'last_error': None,
+                    'last_success': iso(ts)
+                })
             effective_online = True
         else:
             state['consecutive_failures'] += 1
