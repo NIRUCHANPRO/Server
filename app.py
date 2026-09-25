@@ -18,6 +18,7 @@ VERIFY_ATTEMPTS = max(1, int(os.getenv('VERIFY_ATTEMPTS', '3')))
 VERIFY_DELAY = max(1, float(os.getenv('VERIFY_DELAY', '2')))
 HIGH_LATENCY = float(os.getenv('HIGH_LATENCY_MS', '300'))
 ALERT_COOLDOWN = max(60, int(os.getenv('ALERT_COOLDOWN_SECONDS', '900')))
+OFFLINE_CONFIRMATION_CYCLES = max(1, int(os.getenv('OFFLINE_CONFIRMATION_CYCLES', '3')))
 REPORT_HOUR_UTC = int(os.getenv('DAILY_REPORT_HOUR_UTC', '18'))
 REPORT_MINUTE_UTC = int(os.getenv('DAILY_REPORT_MINUTE_UTC', '30'))
 
@@ -27,6 +28,7 @@ state = {
     'latency': None, 'version': 'Unknown', 'protocol': None, 'motd': '',
     'player_names': [], 'last_check': None, 'last_success': None,
     'last_change': None, 'online_since': None, 'downtime_since': None,
+    'has_seen_success': False,
     'last_error': None, 'consecutive_failures': 0, 'consecutive_successes': 0,
     'monitor_started': datetime.now(timezone.utc).isoformat(),
 }
@@ -146,73 +148,118 @@ def process(r):
         old_online = previous_online
         old_names = previous_names
         ts = now()
-        state.update({'online': r['online'], 'confirmed': bool(r['online']), 'players':r['players'], 'max_players':r['max_players'], 'latency':r['latency'], 'version':r['version'], 'protocol':r['protocol'], 'motd':r['motd'], 'player_names':sorted(r['names']), 'last_check':iso(ts), 'last_error':r['error']})
+
+        # A complete verification failure can be a transient route/query timeout.
+        # Never flip a previously-ONLINE server to OFFLINE because of one failed
+        # verification cycle. Require several consecutive failed cycles instead.
         if r['online']:
-            state['last_success']=iso(ts); state['consecutive_successes']+=1; state['consecutive_failures']=0
+            state['consecutive_failures'] = 0
+            state['consecutive_successes'] += 1
+            state['has_seen_success'] = True
+            state.update({
+                'online': True, 'confirmed': True,
+                'players': r['players'], 'max_players': r['max_players'],
+                'latency': r['latency'], 'version': r['version'],
+                'protocol': r['protocol'], 'motd': r['motd'],
+                'player_names': sorted(r['names']),
+                'last_check': iso(ts), 'last_error': None,
+                'last_success': iso(ts)
+            })
+            effective_online = True
         else:
-            state['consecutive_failures']+=1; state['consecutive_successes']=0
-        changed = old_online != r['online']
+            state['consecutive_failures'] += 1
+            state['consecutive_successes'] = 0
+            state['last_check'] = iso(ts)
+            state['last_error'] = r['error']
+
+            # Preserve the last known-good ONLINE state during transient failures.
+            # The dashboard can still show the failure count/reason, while Discord
+            # only receives OFFLINE after N consecutive failed cycles.
+            if old_online and state['consecutive_failures'] < OFFLINE_CONFIRMATION_CYCLES:
+                effective_online = True
+                state['online'] = True
+                state['confirmed'] = True
+            elif old_online and state['consecutive_failures'] >= OFFLINE_CONFIRMATION_CYCLES:
+                effective_online = False
+                state['online'] = False
+                state['confirmed'] = False
+                state['players'] = 0
+                state['max_players'] = 0
+                state['latency'] = None
+                state['version'] = 'Unknown'
+                state['protocol'] = None
+                state['motd'] = ''
+                state['player_names'] = []
+            else:
+                # Before the monitor has ever seen a successful response, don't
+                # send an OFFLINE alert on startup just because the first checks fail.
+                effective_online = False
+                state['online'] = False
+                state['confirmed'] = False
+                state['players'] = 0
+                state['max_players'] = 0
+                state['latency'] = None
+                state['version'] = 'Unknown'
+                state['protocol'] = None
+                state['motd'] = ''
+                state['player_names'] = []
+
+        changed = old_online != effective_online
         if changed:
-            state['last_change']=iso(ts)
-            if r['online']:
-                state['online_since']=iso(ts); state['downtime_since']=None
-                alert('online','🟢 MAHAL SERIES — ONLINE','Minecraft status verified successfully.',0x57F287,[('Players',f"{r['players']}/{r['max_players']}",True),('Ping',f"{r['latency']} ms",True),('Version',r['version'],True),('Verification',f"{r['verification']['successes']}/{r['verification']['attempts']}",True),('Address',f'{HOST}:{PORT}',False)],force=True)
+            state['last_change'] = iso(ts)
+            if effective_online:
+                state['online_since'] = iso(ts)
+                state['downtime_since'] = None
+                alert('online','🟢 MAHAL SERIES — ONLINE','Minecraft status verified successfully.',0x57F287,[
+                    ('Players',f"{r['players']}/{r['max_players']}",True),
+                    ('Ping',f"{r['latency']} ms",True),
+                    ('Version',r['version'],True),
+                    ('Verification',f"{r['verification']['successes']}/{r['verification']['attempts']}",True),
+                    ('Address',f'{HOST}:{PORT}',False)],force=True)
                 event('online','Server verified ONLINE',r['players'],r['latency'])
                 db_exec('UPDATE downtime SET ended_at=%s WHERE ended_at IS NULL',(ts,))
             else:
-                state['downtime_since']=iso(ts); state['online_since']=None
-                alert('offline','🔴 MAHAL SERIES — OFFLINE','Server failed all verification attempts.',0xED4245,[('Verification',f"{r['verification']['successes']}/{r['verification']['attempts']} successful",True),('Last success',state.get('last_success') or 'None',False),('Address',f'{HOST}:{PORT}',False),('Reason',r['error'] or 'Unknown',False)],force=True)
-                event('offline','Server verified OFFLINE',0,None,{'error':r['error']})
+                state['downtime_since'] = iso(ts)
+                state['online_since'] = None
+                alert('offline','🔴 MAHAL SERIES — OFFLINE','Server failed repeated verification cycles.',0xED4245,[
+                    ('Verification',f"{r['verification']['successes']}/{r['verification']['attempts']} successful",True),
+                    ('Consecutive failed cycles',str(state['consecutive_failures']),True),
+                    ('Last success',state.get('last_success') or 'None',False),
+                    ('Address',f'{HOST}:{PORT}',False),
+                    ('Reason',r['error'] or 'Unknown',False)],force=True)
+                event('offline','Server verified OFFLINE after repeated failures',0,None,{'error':r['error']})
                 db_exec('INSERT INTO downtime(started_at,reason) VALUES(%s,%s)',(ts,r['error']))
-        elif r['online'] and old_online:
-            joined=r['names']-old_names; left=old_names-r['names']
+        elif effective_online and old_online:
+            # Use the latest successful sample for player/session/latency events.
+            joined=r['names']-old_names
+            left=old_names-r['names']
             for n in sorted(joined):
-                alert('join:'+n,'👤 PLAYER JOINED',f'`{n}` joined Mahal Series.',0x57F287,[('Players',f"{r['players']}/{r['max_players']}",True),('Ping',f"{r['latency']} ms",True)],force=True); event('player_join',f'Player joined: {n}',r['players'],r['latency']); open_session(n,ts)
+                alert('join:'+n,'👤 PLAYER JOINED',f'`{n}` joined Mahal Series.',0x57F287,[
+                    ('Players',f"{r['players']}/{r['max_players']}",True),
+                    ('Ping',f"{r['latency']} ms",True)],force=True)
+                event('player_join',f'Player joined: {n}',r['players'],r['latency'])
+                open_session(n,ts)
             for n in sorted(left):
-                alert('leave:'+n,'👋 PLAYER LEFT',f'`{n}` left Mahal Series.',0x5865F2,[('Players',f"{r['players']}/{r['max_players']}",True),('Ping',f"{r['latency']} ms",True)],force=True); event('player_leave',f'Player left: {n}',r['players'],r['latency']); close_session(n,ts)
+                alert('leave:'+n,'👋 PLAYER LEFT',f'`{n}` left Mahal Series.',0x5865F2,[
+                    ('Players',f"{r['players']}/{r['max_players']}",True),
+                    ('Ping',f"{r['latency']} ms",True)],force=True)
+                event('player_leave',f'Player left: {n}',r['players'],r['latency'])
+                close_session(n,ts)
             if r['latency'] is not None and r['latency'] >= HIGH_LATENCY:
                 msg=f'🟡 **HIGH LATENCY**\nPing: `{r["latency"]} ms`\nPlayers: `{r["players"]}/{r["max_players"]}`'
-                alert('high_latency','🟡 HIGH LATENCY',msg,0xFEE75C,[('Ping',f"{r['latency']} ms",True),('Players',f"{r['players']}/{r['max_players']}",True)]); event('high_latency',msg,r['players'],r['latency'])
-        previous_online=r['online']; previous_names=r['names']
-        recent_samples.append({'time':iso(ts),'online':r['online'],'players':r['players'],'latency':r['latency']})
-    db_exec('INSERT INTO checks(checked_at,online,players,max_players,latency_ms,version,protocol,motd,error,success_attempt) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(ts,r['online'],r['players'],r['max_players'],r['latency'],r['version'],r['protocol'],r['motd'],r['error'],r.get('success_attempt')))
-    db_exec('INSERT INTO player_snapshots(captured_at,players,player_names) VALUES(%s,%s,%s::jsonb)',(ts,r['players'],json.dumps(sorted(r['names']))))
+                alert('high_latency','🟡 HIGH LATENCY',msg,0xFEE75C,[
+                    ('Ping',f"{r['latency']} ms",True),
+                    ('Players',f"{r['players']}/{r['max_players']}",True)])
+                event('high_latency',msg,r['players'],r['latency'])
 
-def format_duration(sec):
-    sec=max(0,int(sec)); d,rem=divmod(sec,86400); h,rem=divmod(rem,3600); m,s=divmod(rem,60)
-    return ' '.join(([f'{d}d'] if d else [])+([f'{h}h'] if h else [])+([f'{m}m'] if m else [])+([f'{s}s'] if s or not (d or h or m) else []))
+        previous_online = effective_online
+        previous_names = r['names'] if effective_online and r['online'] else old_names
+        recent_samples.append({'time':iso(ts),'online':effective_online,'players':state['players'],'latency':state['latency']})
 
-def send_daily_report(day):
-    end=datetime(day.year,day.month,day.day,tzinfo=timezone.utc)+timedelta(days=1); start=end-timedelta(days=1)
-    if not db_ready:return False
-    try:
-        with db_connect() as c:
-            with c.cursor() as x:
-                x.execute('SELECT COUNT(*),COALESCE(SUM(CASE WHEN online THEN 1 ELSE 0 END),0),COALESCE(MAX(players),0),AVG(CASE WHEN online THEN latency_ms END) FROM checks WHERE checked_at >= %s AND checked_at < %s',(start,end)); a=x.fetchone()
-                x.execute('SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(ended_at,%s)-started_at)),0),0) FROM downtime WHERE started_at < %s AND (ended_at IS NULL OR ended_at > %s)',(end,end,start)); down=float(x.fetchone()[0] or 0)
-                counts={}
-                for typ in ('player_join','player_leave','high_latency'):
-                    x.execute('SELECT COUNT(*) FROM events WHERE created_at >= %s AND created_at < %s AND event_type=%s',(start,end,typ)); counts[typ]=int(x.fetchone()[0] or 0)
-        checks=int(a[0] or 0); online=int(a[1] or 0); uptime=round(online/checks*100,2) if checks else 0
-        fields=[('Uptime',f'{uptime}%',True),('Downtime',format_duration(down),True),('Peak players',int(a[2] or 0),True),('Average ping',f'{round(float(a[3]),1)} ms' if a[3] is not None else '—',True),('Joins',counts['player_join'],True),('Leaves',counts['player_leave'],True),('High latency',counts['high_latency'],True),('Checks',checks,True)]
-        delivered=discord_embed('📊 MAHAL SERIES — DAILY REPORT',f'Daily report for **{day.isoformat()} UTC**\n`{HOST}:{PORT}`',0x5865F2,fields)
-        db_exec('INSERT INTO daily_reports(report_date,generated_at,delivered,payload) VALUES(%s,%s,%s,%s::jsonb) ON CONFLICT(report_date) DO UPDATE SET generated_at=EXCLUDED.generated_at,delivered=EXCLUDED.delivered,payload=EXCLUDED.payload',(day,now(),delivered,json.dumps({'uptime_percent':uptime,'downtime_seconds':down})))
-        return delivered
-    except Exception as e:
-        print('Daily report error:',e); return False
-
-def maybe_daily_report():
-    global last_daily_report_date
-    t=now(); target=(t-timedelta(days=1)).date()
-    if t.hour==REPORT_HOUR_UTC and t.minute>=REPORT_MINUTE_UTC and last_daily_report_date!=target:
-        send_daily_report(target); last_daily_report_date=target
-
-def monitor():
-    time.sleep(2)
-    while True:
-        try: process(verified_check()); maybe_daily_report()
-        except Exception as e: print('Monitor:',e)
-        time.sleep(INTERVAL)
+    db_exec('INSERT INTO checks(checked_at,online,players,max_players,latency_ms,version,protocol,motd,error,success_attempt) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',(
+        ts,state['online'],state['players'],state['max_players'],state['latency'],state['version'],state['protocol'],state['motd'],r['error'],r.get('success_attempt')))
+    db_exec('INSERT INTO player_snapshots(captured_at,players,player_names) VALUES(%s,%s,%s::jsonb)',(
+        ts,state['players'],json.dumps(state['player_names'])))
 
 def stats(hours=24):
     if not db_ready: return {'database':False,'hours':hours}
