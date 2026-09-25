@@ -308,6 +308,20 @@ def rows(q,p=()):
             with c.cursor() as x:x.execute(q,p); return x.fetchall()
     except:return []
 
+
+def monitor():
+    # Background monitoring loop. Keep the web process alive even if a single
+    # Minecraft probe or database operation fails.
+    while True:
+        started = time.monotonic()
+        try:
+            result = verified_check()
+            process(result)
+        except Exception as e:
+            print('Monitor cycle error:', repr(e), flush=True)
+        elapsed = time.monotonic() - started
+        time.sleep(max(1.0, INTERVAL - elapsed))
+
 @app.route('/')
 def dashboard():
     return render_template_string(HTML, host=HOST, port=PORT, interval=INTERVAL)

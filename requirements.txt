@@ -1,5 +1,5 @@
 Flask>=3,<4
-mcstatus>=11,<13
+mcstatus>=11,<15
 gunicorn>=22,<24
 requests>=2.32,<3
 psycopg[binary]>=3.2,<4
